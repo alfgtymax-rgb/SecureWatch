@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-SecureWatch - Semana 9: agente de seguridad, inventario y HEARTBEAT.
+SecureWatch - Semana 10: agente de seguridad, inventario, HEARTBEAT e
+identificación de software vulnerable (API NVD 2.0).
 
 Mantiene el análisis de la semana 7 y el envío del informe completo de la
 semana 8, y añade:
@@ -12,10 +13,21 @@ semana 8, y añade:
 - Control de errores de conexión: si el servidor no está disponible, el
   agente lo indica y sigue funcionando hasta que vuelva a estarlo.
 
+Semana 10 (módulo identificacion.py):
+- Con --identificar se normaliza software.json, se busca el CPE de cada
+  programa y sus CVE en la API NVD 2.0, se compara la versión instalada con
+  packaging.version y se genera vulnerabilidades.json.
+- Un resumen compacto de vulnerabilidades.json se incluye en el informe
+  completo (clave "vulnerabilidades") y el detalle completo se envía a
+  POST /api/vulnerabilidades.
+- Si existe la variable de entorno NVD_API_KEY, se usa (consultas más rápidas).
+
 Uso:
     python main.py                  informe + HEARTBEAT continuo (Ctrl+C para parar)
     python main.py --solo-informe   comportamiento de la semana 8 (un envío y termina)
     python main.py --servidor 192.168.1.38   usar otro servidor sin editar el código
+    python main.py --identificar    además identifica CVE del software instalado (semana 10)
+    python main.py --identificar --solo-informe   identificación + un envío y termina
 """
 
 import argparse
@@ -33,6 +45,21 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import requests
+
+# Semana 10: identificación de vulnerabilidades. Se importa de forma tolerante
+# para que el agente siga funcionando aunque falte el módulo o 'packaging'.
+try:
+    from identificacion import (
+        analizar_vulnerabilidades,
+        mostrar_resumen_vulnerabilidades,
+        resumen_compacto,
+    )
+    ERROR_IMPORTACION_IDENTIFICACION: Optional[str] = None
+except ImportError as _error_importacion:  # pragma: no cover
+    analizar_vulnerabilidades = None  # type: ignore[assignment]
+    mostrar_resumen_vulnerabilidades = None  # type: ignore[assignment]
+    resumen_compacto = None  # type: ignore[assignment]
+    ERROR_IMPORTACION_IDENTIFICACION = str(_error_importacion)
 
 CARPETA_PROGRAMA = Path(__file__).resolve().parent
 
@@ -52,13 +79,16 @@ ARCHIVO_UUID = "equipo_uuid.txt"  # identificador persistente del equipo
 
 def configurar_servidor(ip: str) -> None:
     """Cambia la IP del servidor para el informe y el HEARTBEAT."""
-    global IP_SERVIDOR, URL_SERVIDOR, URL_HEARTBEAT
+    global IP_SERVIDOR, URL_SERVIDOR, URL_HEARTBEAT, URL_VULNERABILIDADES
     IP_SERVIDOR = ip
     URL_SERVIDOR = f"http://{IP_SERVIDOR}:{PUERTO_SERVIDOR}/api/equipos"
     URL_HEARTBEAT = f"http://{IP_SERVIDOR}:{PUERTO_SERVIDOR}/api/heartbeat"
+    URL_VULNERABILIDADES = f"http://{IP_SERVIDOR}:{PUERTO_SERVIDOR}/api/vulnerabilidades"
 
 
 URL_HEARTBEAT = f"http://{IP_SERVIDOR}:{PUERTO_SERVIDOR}/api/heartbeat"
+URL_VULNERABILIDADES = f"http://{IP_SERVIDOR}:{PUERTO_SERVIDOR}/api/vulnerabilidades"
+ARCHIVO_VULNERABILIDADES = "vulnerabilidades.json"
 
 NIVELES = ("CRÍTICA", "ALTA", "MEDIA", "AVISO", "INFORMACIÓN")
 PUNTOS_POR_NIVEL = {
@@ -899,11 +929,15 @@ def nombre_valido(valor: Any) -> Optional[str]:
 
 
 def construir_informe() -> Optional[Dict[str, Any]]:
-    """Agrupa en un único objeto el contenido de los cinco informes del equipo.
+    """Agrupa en un único objeto el contenido de los informes del equipo.
 
     Cada clave del objeto corresponde a uno de los archivos JSON generados en
     las semanas anteriores. Si alguno no se puede leer, leer_json ya lo avisa
     y su contenido se envía como null, para que el servidor vea que falta.
+
+    Semana 10: si existe vulnerabilidades.json se añade con la clave
+    "vulnerabilidades". Si no existe (no se ha ejecutado --identificar) se
+    envía null sin avisar, porque es un análisis opcional.
     """
     archivos = {
         "datos_equipo": "equipo.json",
@@ -916,6 +950,17 @@ def construir_informe() -> Optional[Dict[str, Any]]:
     bloques: Dict[str, Any] = {}
     for clave, nombre in archivos.items():
         bloques[clave] = leer_json(nombre)
+
+    if (CARPETA_PROGRAMA / ARCHIVO_VULNERABILIDADES).exists():
+        vulnerabilidades = leer_json(ARCHIVO_VULNERABILIDADES)
+        # Se envía la versión compacta (resumen + CVE afectados/indeterminados)
+        # para no inflar registros.json; el detalle completo va aparte a
+        # POST /api/vulnerabilidades.
+        if isinstance(vulnerabilidades, dict) and resumen_compacto is not None:
+            vulnerabilidades = resumen_compacto(vulnerabilidades)
+        bloques["vulnerabilidades"] = vulnerabilidades
+    else:
+        bloques["vulnerabilidades"] = None
 
     # El nombre del equipo identifica el informe. Se toma de equipo.json y, si
     # no está disponible, de alertas.json, que también lo incluye.
@@ -971,6 +1016,57 @@ def enviar_informe(informe: Dict[str, Any]) -> bool:
         return True
 
     print(f"El servidor ha rechazado el informe (HTTP {respuesta.status_code}).")
+    print(f"Respuesta del servidor: {respuesta.text}")
+    return False
+
+
+# ---------------------------------------------------------------------------
+# Semana 10: identificación de software vulnerable (NVD)
+# ---------------------------------------------------------------------------
+
+def ejecutar_identificacion() -> Optional[Dict[str, Any]]:
+    """Ejecuta identificacion.py y devuelve el informe de vulnerabilidades.
+
+    Cualquier fallo (módulo ausente, error inesperado) se informa y devuelve
+    None: el resto del agente (informe y HEARTBEAT) sigue funcionando. Los
+    errores de red con la NVD los gestiona el propio módulo programa a
+    programa (estado ERROR_NVD).
+    """
+    if analizar_vulnerabilidades is None:
+        print(f"Aviso: no se puede ejecutar la identificación de vulnerabilidades: "
+              f"{ERROR_IMPORTACION_IDENTIFICACION}")
+        print("Instala la dependencia con: python -m pip install packaging")
+        return None
+
+    try:
+        informe = analizar_vulnerabilidades(CARPETA_PROGRAMA)
+    except Exception as error:  # noqa: BLE001 - el agente no debe detenerse
+        print(f"Error durante la identificación de vulnerabilidades: {error}")
+        return None
+
+    if mostrar_resumen_vulnerabilidades is not None:
+        mostrar_resumen_vulnerabilidades(informe)
+    return informe
+
+
+def enviar_vulnerabilidades(informe: Dict[str, Any]) -> bool:
+    """Envía vulnerabilidades.json a POST /api/vulnerabilidades.
+
+    Mismo control de errores que enviar_informe(): nunca lanza excepciones.
+    """
+    print(f"Enviando vulnerabilidades de {informe.get('equipo')} a {URL_VULNERABILIDADES} ...")
+    try:
+        # Timeout mayor: el informe puede ocupar varios cientos de KB.
+        respuesta = requests.post(URL_VULNERABILIDADES, json=informe, timeout=TIEMPO_ESPERA * 4)
+    except requests.exceptions.RequestException as error:
+        print(f"No se han podido enviar las vulnerabilidades: {error}")
+        return False
+
+    if 200 <= respuesta.status_code < 300:
+        print(f"Vulnerabilidades aceptadas por el servidor (HTTP {respuesta.status_code}).")
+        return True
+
+    print(f"El servidor ha rechazado las vulnerabilidades (HTTP {respuesta.status_code}).")
     print(f"Respuesta del servidor: {respuesta.text}")
     return False
 
@@ -1086,11 +1182,13 @@ def bucle_heartbeat(id_equipo: str) -> None:
 
 
 def main(argv: Optional[List[str]] = None) -> int:
-    parser = argparse.ArgumentParser(description="SecureWatch Semana 9")
+    parser = argparse.ArgumentParser(description="SecureWatch Semana 10")
     parser.add_argument("--recolectar", action="store_true", help="Recolectar datos del sistema (Windows)")
     parser.add_argument("--solo-informe", action="store_true",
                         help="Enviar el informe completo y terminar, sin HEARTBEAT (semana 8)")
     parser.add_argument("--servidor", metavar="IP", help="IP del servidor central (por defecto IP_SERVIDOR)")
+    parser.add_argument("--identificar", "--vulnerabilidades", dest="identificar", action="store_true",
+                        help="Identificar CVE del software instalado con la API NVD 2.0 (semana 10)")
     args = parser.parse_args(argv)
 
     if args.servidor:
@@ -1106,6 +1204,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     mostrar_resumen(equipo, alertas, resumen, score, riesgo, sin_comprobar)
     guardar_alertas(equipo, alertas, resumen, score, riesgo, sin_comprobar)
 
+    # Semana 10: genera vulnerabilidades.json antes de construir el informe,
+    # para que viaje dentro de él con la clave "vulnerabilidades".
+    informe_vulnerabilidades = ejecutar_identificacion() if args.identificar else None
+
     informe = construir_informe()
     if informe is None:
         return 1
@@ -1113,6 +1215,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     # El informe completo incluye ahora también el UUID del equipo.
     informe["uuid"] = id_equipo
     informe_enviado = enviar_informe(informe)
+
+    if informe_vulnerabilidades is not None:
+        enviar_vulnerabilidades(informe_vulnerabilidades)
 
     if args.solo_informe:
         return 0 if informe_enviado else 1

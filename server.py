@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-SecureWatch - Semana 9: servidor central.
+SecureWatch - Semana 10: servidor central.
 
 Mantiene la recepción y almacenamiento de informes completos (Semana 8) y añade:
 - POST /api/heartbeat : recibe señales periódicas de los agentes y actualiza
@@ -12,6 +12,13 @@ Mantiene la recepción y almacenamiento de informes completos (Semana 8) y añad
 
 El inventario se persiste en inventario.json. Los informes completos siguen
 guardándose en registros.json como en la Semana 8.
+
+Semana 10 - identificación de software vulnerable:
+- POST /api/vulnerabilidades          : recibe vulnerabilidades.json de un agente
+  y lo guarda (sustituye al anterior del mismo equipo).
+- GET  /api/vulnerabilidades          : devuelve los informes de todos los equipos.
+- GET  /api/vulnerabilidades/{equipo} : devuelve el informe de un equipo.
+Se persisten en vulnerabilidades.json (diccionario cuya clave es el equipo).
 
 Ejecución:
     python -m uvicorn server:app --host 0.0.0.0 --port 8000
@@ -32,6 +39,7 @@ from fastapi import Body, FastAPI, HTTPException
 CARPETA_PROGRAMA = Path(__file__).resolve().parent
 ARCHIVO_REGISTROS = CARPETA_PROGRAMA / "registros.json"
 ARCHIVO_INVENTARIO = CARPETA_PROGRAMA / "inventario.json"
+ARCHIVO_VULNERABILIDADES = CARPETA_PROGRAMA / "vulnerabilidades.json"
 
 # Un equipo pasa a OFFLINE si no ha enviado señal en más de 90 segundos.
 UMBRAL_OFFLINE_SEGUNDOS = 90
@@ -39,15 +47,18 @@ UMBRAL_OFFLINE_SEGUNDOS = 90
 # Bloqueos independientes para cada archivo de persistencia.
 BLOQUEO = threading.Lock()
 BLOQUEO_INVENTARIO = threading.Lock()
+BLOQUEO_VULNERABILIDADES = threading.Lock()
 
 app = FastAPI(
     title="SecureWatch - Servidor central",
     description=(
         "Recepción y consulta de los informes de seguridad enviados por los "
         "equipos de la red. Incluye inventario centralizado y control de "
-        "disponibilidad mediante señales HEARTBEAT (Semana 9)."
+        "disponibilidad mediante señales HEARTBEAT (Semana 9) e identificación "
+        "de software vulnerable con la API NVD 2.0 (Semana 10). "
+        "This product uses the NVD API but is not endorsed or certified by the NVD."
     ),
-    version="2.0",
+    version="3.0",
 )
 
 
@@ -143,6 +154,52 @@ def guardar_inventario(inventario: Dict[str, Any]) -> None:
         archivo.write("\n")
 
     os.replace(temporal, ARCHIVO_INVENTARIO)
+
+
+# ---------------------------------------------------------------------------
+# Persistencia: vulnerabilidades por equipo (Semana 10)
+# ---------------------------------------------------------------------------
+
+def leer_vulnerabilidades() -> Dict[str, Any]:
+    """Devuelve los informes de vulnerabilidades guardados por equipo.
+
+    El archivo contiene un diccionario cuya clave es el nombre del equipo.
+    Si no existe o está vacío, devuelve un diccionario vacío.
+    Si el contenido no es JSON válido o no es un dict, lanza ValueError.
+    """
+    if not ARCHIVO_VULNERABILIDADES.exists():
+        return {}
+
+    texto = ARCHIVO_VULNERABILIDADES.read_text(encoding="utf-8")
+
+    if not texto.strip():
+        return {}
+
+    try:
+        datos = json.loads(texto)
+    except json.JSONDecodeError as error:
+        raise ValueError(
+            f"{ARCHIVO_VULNERABILIDADES.name} no contiene JSON válido ({error})."
+        ) from error
+
+    if not isinstance(datos, dict):
+        raise ValueError(
+            f"{ARCHIVO_VULNERABILIDADES.name} debería contener un objeto JSON "
+            f"y contiene {type(datos).__name__}."
+        )
+
+    return datos
+
+
+def guardar_vulnerabilidades(vulnerabilidades: Dict[str, Any]) -> None:
+    """Escribe vulnerabilidades.json completo de forma atómica."""
+    temporal = ARCHIVO_VULNERABILIDADES.with_suffix(".json.tmp")
+
+    with open(temporal, "w", encoding="utf-8") as archivo:
+        json.dump(vulnerabilidades, archivo, ensure_ascii=False, indent=4)
+        archivo.write("\n")
+
+    os.replace(temporal, ARCHIVO_VULNERABILIDADES)
 
 
 # ---------------------------------------------------------------------------
@@ -359,3 +416,113 @@ def listar_inventario() -> List[Dict[str, Any]]:
         resultado.append(equipo_con_estado)
 
     return resultado
+
+
+# ---------------------------------------------------------------------------
+# Endpoints: vulnerabilidades (Semana 10)
+# ---------------------------------------------------------------------------
+
+@app.post("/api/vulnerabilidades", status_code=201)
+def recibir_vulnerabilidades(informe: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
+    """Recibe el contenido de vulnerabilidades.json generado por un agente.
+
+    Debe incluir el campo "equipo". Se guarda bajo esa clave, sustituyendo el
+    informe anterior del mismo equipo (el análisis más reciente es el válido).
+    """
+    equipo = informe.get("equipo")
+
+    if not isinstance(equipo, str) or not equipo.strip() or equipo.strip().lower() == "desconocido":
+        raise HTTPException(
+            status_code=422,
+            detail="El informe de vulnerabilidades debe incluir el campo 'equipo'.",
+        )
+
+    if not isinstance(informe.get("resultados", []), list):
+        raise HTTPException(
+            status_code=422,
+            detail="El campo 'resultados' debe ser una lista.",
+        )
+
+    equipo = equipo.strip()
+    recibido_en = datetime.now().astimezone().isoformat(timespec="seconds")
+    registro = dict(informe)
+    registro["equipo"] = equipo
+    registro["recibido_en"] = recibido_en
+
+    with BLOQUEO_VULNERABILIDADES:
+        try:
+            vulnerabilidades = leer_vulnerabilidades()
+        except ValueError as error:
+            raise HTTPException(
+                status_code=500,
+                detail=(
+                    f"No se ha guardado el informe de vulnerabilidades: {error} "
+                    "Revisa el archivo antes de continuar."
+                ),
+            ) from error
+
+        es_nuevo = equipo not in vulnerabilidades
+        vulnerabilidades[equipo] = registro
+
+        try:
+            guardar_vulnerabilidades(vulnerabilidades)
+        except OSError as error:
+            raise HTTPException(
+                status_code=500,
+                detail=(
+                    f"No se ha podido escribir {ARCHIVO_VULNERABILIDADES.name}: {error}"
+                ),
+            ) from error
+
+    resumen = informe.get("resumen") if isinstance(informe.get("resumen"), dict) else {}
+    print(
+        f"[VULNERABILIDADES] {'REGISTRADO' if es_nuevo else 'ACTUALIZADO'}: {equipo} "
+        f"| programas afectados {resumen.get('programas_afectados', '?')} "
+        f"| CVE afectados {resumen.get('cve_afectados', '?')} "
+        f"| {recibido_en}"
+    )
+
+    return {
+        "mensaje": "Informe de vulnerabilidades recibido y guardado.",
+        "equipo": equipo,
+        "recibido_en": recibido_en,
+        "resumen": resumen,
+        "total_equipos": len(vulnerabilidades),
+    }
+
+
+@app.get("/api/vulnerabilidades")
+def listar_vulnerabilidades() -> List[Dict[str, Any]]:
+    """Devuelve el último informe de vulnerabilidades de cada equipo."""
+    try:
+        return list(leer_vulnerabilidades().values())
+    except ValueError as error:
+        raise HTTPException(
+            status_code=500,
+            detail=f"No se han podido leer las vulnerabilidades: {error}",
+        ) from error
+
+
+@app.get("/api/vulnerabilidades/{equipo}")
+def obtener_vulnerabilidades_equipo(equipo: str) -> Dict[str, Any]:
+    """Devuelve el informe de vulnerabilidades de un equipo concreto.
+
+    La búsqueda no distingue mayúsculas y minúsculas. 404 si no existe.
+    """
+    try:
+        vulnerabilidades = leer_vulnerabilidades()
+    except ValueError as error:
+        raise HTTPException(
+            status_code=500,
+            detail=f"No se han podido leer las vulnerabilidades: {error}",
+        ) from error
+
+    buscado = equipo.strip().lower()
+    for nombre, informe in vulnerabilidades.items():
+        if nombre.lower() == buscado:
+            return informe
+
+    raise HTTPException(
+        status_code=404,
+        detail=f"No hay informe de vulnerabilidades para el equipo '{equipo}'.",
+    )
