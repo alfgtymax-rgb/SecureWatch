@@ -1,0 +1,20 @@
+# Datos generados en ejecución (pueden contener información personal del equipo)
+equipo.json
+seguridad.json
+actualizaciones.json
+alertas.json
+software.json
+servicios.json
+arranque.json
+cuentas.json
+cifrado.json
+registros.json
+inventario.json
+vulnerabilidades.json
+nvd_cache.json
+cpe_manual.json
+equipo_uuid.txt
+*.json.tmp
+__pycache__/
+*.pyc
+.abacus.donotdelete
